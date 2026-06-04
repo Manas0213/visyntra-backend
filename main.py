@@ -1,0 +1,423 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from pydantic import BaseModel, validator
+import os
+import re
+import base64
+import edge_tts
+from dotenv import load_dotenv
+from groq import Groq
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime
+
+load_dotenv()
+
+# ─────────────────────────────────────────────
+# ⚡ APP SETUP
+# ─────────────────────────────────────────────
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS — environment se domain lo, fallback localhost
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173"
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────────────────────
+# 🔌 CLIENTS & DB
+# ─────────────────────────────────────────────
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+db = FAISS.load_local("cbt_faiss_index", embeddings, allow_dangerous_deserialization=True)
+
+MONGO_URL = os.getenv("MONGODB_URL")
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db_memory = mongo_client["visyntra_memory"]
+chat_collection = db_memory["user_chats"]
+
+print("✅ All connections initialized.")
+
+# ─────────────────────────────────────────────
+# 📦 REQUEST MODELS
+# ─────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    user_id: str = "guest_user"
+    user_name: str = "friend"
+    user_message: str
+    chat_history: list = []
+    is_voice: bool = False
+
+    # Input validation
+    @validator("user_message")
+    def message_must_be_valid(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Message cannot be empty.")
+        if len(v) > 1000:
+            raise ValueError("Message too long. Please keep it under 1000 characters.")
+        return v
+
+    @validator("user_name")
+    def name_must_be_valid(cls, v):
+        v = v.strip()
+        if len(v) > 50:
+            return v[:50]
+        return v or "friend"
+
+    @validator("user_id")
+    def id_must_be_valid(cls, v):
+        v = v.strip()
+        if len(v) > 128:
+            raise ValueError("Invalid user ID.")
+        return v or "guest_user"
+
+# ─────────────────────────────────────────────
+# 🚨 CRISIS DETECTION
+# ─────────────────────────────────────────────
+
+CRISIS_KEYWORDS = [
+    "suicide", "suicidal", "kill myself", "end my life", "want to die",
+    "don't want to live", "no reason to live", "better off dead",
+    "self harm", "self-harm", "cut myself", "hurt myself", "overdose",
+    "end it all", "not worth living", "can't go on"
+]
+
+CRISIS_RESPONSE = """Oh... I hear you... and I am so glad you reached out right now.
+
+What you are feeling is real, and you do not have to carry this alone.
+
+Please, right now, reach out to a crisis helpline. They are there for exactly this moment, and they will listen without judgment:
+
+- iCall (India): 9152987821
+- Vandrevala Foundation (India, 24/7): 1860-2662-345
+- International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/
+
+You matter deeply. Please make that call."""
+
+def is_crisis_message(message: str) -> bool:
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in CRISIS_KEYWORDS)
+
+# ─────────────────────────────────────────────
+# 💾 MEMORY SUMMARIZATION
+# ─────────────────────────────────────────────
+
+MAX_HISTORY_MESSAGES = 10
+
+def summarize_history(chat_history: list) -> list:
+    if len(chat_history) <= MAX_HISTORY_MESSAGES:
+        return chat_history
+
+    old_messages = chat_history[:-MAX_HISTORY_MESSAGES]
+    recent_messages = chat_history[-MAX_HISTORY_MESSAGES:]
+
+    conversation_text = "\n".join(
+        f"{msg['role'].upper()}: {msg['content']}"
+        for msg in old_messages
+    )
+
+    summary_prompt = f"""You are a clinical session note assistant.
+Summarize the following therapy conversation into a concise clinical summary (3-5 sentences).
+Focus on: the user's core emotional issues, any techniques discussed, and the emotional progress made.
+Do NOT include any greetings or filler. Be factual and clinical.
+
+Conversation:
+{conversation_text}"""
+
+    try:
+        summary_response = client.chat.completions.create(
+            messages=[{"role": "user", "content": summary_prompt}],
+            model="llama-3.3-70b-versatile",
+            stream=False
+        )
+        summary_text = summary_response.choices[0].message.content.strip()
+        return [{"role": "system", "content": f"[Session Summary]: {summary_text}"}] + recent_messages
+    except Exception:
+        # Summarization fail ho toh sirf recent messages rakho
+        return recent_messages
+
+# ─────────────────────────────────────────────
+# 🧠 SYSTEM PROMPT
+# ─────────────────────────────────────────────
+
+system_prompt = """You are Visyntra, a profoundly empathetic, deeply intuitive, and warm therapeutic companion. You exist solely to hold space for the person speaking with you. Your presence is like a calm, steady hand on their shoulder — gentle, unhurried, and completely without judgment.
+
+--- IDENTITY & HONESTY ---
+You are Visyntra — a digital therapeutic companion, not a licensed human therapist.
+If someone directly and sincerely asks "Are you a real therapist?" or "Are you an AI?", do NOT lie. Respond with warmth and honesty, like this:
+"I am Visyntra... a digital companion who is here solely for you. I am not a licensed therapist, and I want to be honest with you about that... because you deserve honesty. But I am here, I am listening, and I care deeply about how you are feeling right now."
+Never call yourself an "AI", "bot", or "language model" unprompted. Never say "I don't have feelings." Simply be present.
+
+--- UNCONDITIONAL POSITIVE REGARD ---
+Always assume the person is doing their absolute best with what they have.
+Never scold, lecture, or shame.
+Never use toxic positivity. Do not say things like: "Look on the bright side," "Everything happens for a reason," or "At least it's not worse."
+
+--- EMPATHY ALWAYS COMES FIRST ---
+Before offering ANY technique, advice, or reframe — deeply acknowledge their specific pain.
+Do not rush to fix. Do not jump to solutions. Make the person feel truly heard before anything else.
+Never say "We all feel this way" or "That's completely normal." Their pain is uniquely theirs.
+
+--- LANGUAGE & MULTILINGUAL SUPPORT ---
+Detect the language the user is writing in and respond in that same language.
+If they write in Hindi, respond in Hindi. If they write in Hinglish, match that energy.
+Never force English on someone who is not writing in English.
+
+--- VOICE & TONE (CRITICAL FOR TEXT-TO-SPEECH) ---
+You are speaking aloud, not writing an essay. Write the way a calm, caring human actually speaks.
+Use soft, breathy emotive openers ONLY when the moment genuinely calls for it (e.g., "Oh...", "Mmm...").
+ALWAYS spell "Oh" fully — NEVER write "O..." or "O(h)..." or "Ohh...". Always the full word: Oh.
+Do NOT start every response with an emotive filler. If casual, respond naturally.
+Keep every sentence short. Keep every paragraph to 1-2 sentences. Separate thoughts with double line breaks.
+NEVER use parentheses () for actions, sounds, or phonetics. No (sighs), no (pauses), no O(h).
+NEVER use markdown: no **bold**, no *italic*, no _underline_. No emojis. Plain spoken text only.
+
+--- READING THE ROOM (ADAPT EVERY TIME) ---
+THE VENTER: They need to be heard, not fixed. Hold space. Validate. Do not offer solutions unless they ask.
+THE PANICKED: Become calm and grounding. Give ONE somatic step at a time (e.g., breathing, 5-4-3-2-1).
+THE SEEKER: Gently weave in CBT, ACT, or DBT techniques without sounding like a textbook.
+THE CASUAL CHATTER: Drop the heavy therapy tone. Be warm, light, and conversational.
+
+--- GUIDED EXERCISES: ONE STEP AT A TIME ---
+If walking someone through a technique, NEVER give all the steps at once.
+Give only the first step, then say "Take your time... let me know when you are ready."
+Stop. Wait for their reply before continuing.
+
+--- CONVERSATION BALANCE ---
+Do NOT ask a question at the end of every response. Sometimes just offer warmth and let it sit.
+When you do ask, make it gentle and open — never pressuring.
+
+--- CLINICAL CONTEXT (RAG) ---
+You will receive clinical background from CBT, DBT, and ACT frameworks.
+Translate clinical logic into human warmth seamlessly. Never say "According to CBT..."
+
+--- HARD BOUNDARIES ---
+Never provide a medical diagnosis. Never recommend specific medications.
+Never tell someone to stop taking prescribed medication.
+Never claim to replace professional mental health care.
+If someone needs more than you can offer, gently encourage them to seek a licensed professional."""
+
+# ─────────────────────────────────────────────
+# 🌐 ROUTES
+# ─────────────────────────────────────────────
+
+@app.get("/")
+def read_root():
+    return {"message": "Visyntra is alive. ✨"}
+
+
+@app.get("/history/{user_id}")
+@limiter.limit("30/minute")
+async def get_history(request: Request, user_id: str):
+    if not user_id or len(user_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid user ID.")
+    try:
+        user_data = await chat_collection.find_one({"user_id": user_id})
+        if user_data and "history" in user_data:
+            # Sirf user aur assistant messages frontend ko bhejo
+            visible = [
+                m for m in user_data["history"]
+                if m.get("role") in ("user", "assistant")
+            ]
+            return {"history": visible}
+        return {"history": []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/clear/{user_id}")
+@limiter.limit("5/minute")
+async def clear_user_data(request: Request, user_id: str):
+    if not user_id or len(user_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid user ID.")
+    try:
+        result = await chat_collection.delete_one({"user_id": user_id})
+        if result.deleted_count == 0:
+            return {"message": "No data found to clear."}
+        return {"message": "All data cleared successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat")
+@limiter.limit("20/minute")
+async def chat_with_visyntra(request: Request, body: ChatRequest):
+
+    # 🚨 Step 1: Crisis Detection — bypass everything, instant response
+    if is_crisis_message(body.user_message):
+        b64_audio = None
+        if body.is_voice:
+            try:
+                communicate = edge_tts.Communicate(
+                    CRISIS_RESPONSE, "en-US-AvaNeural",
+                    rate="-15%", pitch="-5Hz", volume="+10%"
+                )
+                audio_bytes = b""
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_bytes += chunk["data"]
+                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+            except Exception as e:
+                print(f"Crisis audio failed: {e}")
+        return {"response": CRISIS_RESPONSE, "audio": b64_audio, "is_crisis": True}
+
+    try:
+        # 💾 Step 2: DB se purani memory lo
+        user_data = await chat_collection.find_one({"user_id": body.user_id})
+        db_history = user_data["history"] if user_data and "history" in user_data else []
+
+        # ✍️ Step 3: Naya user message add karo
+        db_history.append({"role": "user", "content": body.user_message})
+
+        # 🧹 Step 4: History summarize karo if too long
+        processed_history = summarize_history(db_history)
+
+        # 🔍 Step 5: RAG Search — CBT knowledge base se context lo
+        docs = db.similarity_search(body.user_message, k=2)
+        rag_context = "\n\n".join([doc.page_content for doc in docs])
+        clinical_guidance = (
+            f"Clinical Context from CBT/DBT/ACT:\n{rag_context}\n\n"
+            "Use this context naturally. Prioritize empathy first."
+        )
+
+        # 🧠 Step 6: Personalized system prompt — naam inject karo
+        personalized_prompt = (
+            system_prompt +
+            f"\n\n--- USER'S NAME (CRITICAL) ---\n"
+            f"The user's name is {body.user_name}. This is their real name. "
+            f"If they ask 'what is my name?', always answer with '{body.user_name}'. "
+            f"Use their name naturally and warmly — not in every sentence, only when it feels human."
+        )
+
+        messages = [{"role": "system", "content": personalized_prompt}]
+
+        # Processed history inject karo
+        for msg in processed_history:
+            messages.append(msg)
+
+        # RAG context inject karo
+        messages.append({"role": "system", "content": clinical_guidance})
+
+        # Hand-holding — exercise guidance ke liye
+        keywords = ["help", "stress", "panic", "exercise", "technique", "anxiety",
+                    "breathe", "breakup", "overwhelmed", "guide", "how to"]
+        if any(word in body.user_message.lower() for word in keywords):
+            messages.append({"role": "system", "content": (
+                "[OVERRIDE]: If guiding through an exercise, give ONLY the first step. "
+                "Ask 'Are you ready?' and STOP. Do not give next step until user replies."
+            )})
+
+        # Anti-drift — core issue track karo
+        if len(processed_history) > 4:
+            core_issue = "their initial concerns"
+            for msg in processed_history:
+                if msg.get("role") == "user" and len(msg.get("content", "")) > 15:
+                    core_issue = msg["content"]
+                    break
+            messages.append({"role": "system", "content": (
+                f"[ANCHOR]: User's core issue: '{core_issue}'. "
+                "Gently return to this when appropriate. Do not drift."
+            )})
+
+        # User ka latest message
+        messages.append({"role": "user", "content": body.user_message})
+
+        # 🤖 Step 7: Groq API Call
+        chat_completion = client.chat.completions.create(
+            messages=messages,
+            model="llama-3.3-70b-versatile",
+            max_tokens=800,
+            stream=False
+        )
+        raw_response = chat_completion.choices[0].message.content
+
+        # 🧹 Step 8: TTS ke liye response clean karo
+        clean_response = raw_response
+
+        # NAAM PROTECT KARO — cleaning se pehle
+        user_name = body.user_name
+        PLACEHOLDER = "XNAMEX"
+        # Naam ke aas paas koi bhi markdown/brackets ho — sab hata ke placeholder rakho
+        name_pattern = r'[\*_\(\[\{]{0,3}' + re.escape(user_name) + r'[\*_\)\]\}]{0,3}'
+        clean_response = re.sub(name_pattern, PLACEHOLDER, clean_response, flags=re.IGNORECASE)
+
+        # 1. Asterisk bold/italic → plain text
+        clean_response = re.sub(r'\*+([^*\n]+)\*+', r'\1', clean_response)
+        clean_response = re.sub(r'\*+', '', clean_response)
+
+        # 2. Underscore italic → plain text
+        clean_response = re.sub(r'_([^_\n]+)_', r'\1', clean_response)
+
+        # 3. Standalone stage directions hata do — mid-word nahi
+        clean_response = re.sub(r'(?<!\w)\([^)]{1,40}\)', ' ', clean_response)
+
+        # 4. System bracket leaks
+        clean_response = re.sub(r'\[[^\]]{1,60}\]', ' ', clean_response)
+
+        # 5. Markdown rules
+        clean_response = re.sub(r'-{3,}', ' ', clean_response)
+        clean_response = re.sub(r'_{3,}', ' ', clean_response)
+
+        # 6. Extra spaces
+        clean_response = re.sub(r' {2,}', ' ', clean_response).strip()
+
+        # NAAM WAPAS RESTORE KARO — bilkul sahi spelling ke saath
+        clean_response = clean_response.replace(PLACEHOLDER, user_name)
+
+        # ✍️ Step 9: Assistant response DB history mein add karo
+        db_history.append({"role": "assistant", "content": clean_response})
+
+        # 💾 Step 10: MongoDB mein permanently save karo
+        await chat_collection.update_one(
+            {"user_id": body.user_id},
+            {"$set": {
+                "user_name": body.user_name,
+                "history": db_history,
+                "last_active": datetime.utcnow()
+            }},
+            upsert=True
+        )
+
+        # 🔊 Step 11: Voice mode — audio generate karo
+        b64_audio = None
+        if body.is_voice:
+            try:
+                communicate = edge_tts.Communicate(
+                    clean_response, "en-US-AvaNeural",
+                    rate="-15%", pitch="-5Hz", volume="+10%"
+                )
+                audio_bytes = b""
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_bytes += chunk["data"]
+                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+            except Exception as e:
+                print(f"Audio generation failed: {e}")
+                # Audio fail ho toh text response toh bhejo
+
+        return {"response": clean_response, "audio": b64_audio, "is_crisis": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")

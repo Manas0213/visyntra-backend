@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+slowapi
+motor
+groq
+edge-tts
+python-dotenv
+langchain-community
+sentence-transformers
+faiss-cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
