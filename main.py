@@ -404,7 +404,7 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
         # 💾 Step 2: DB se purani memory lo
         user_data = await chat_collection.find_one({"user_id": body.user_id})
         db_history = user_data["history"] if user_data and "history" in user_data else []
-        db_facts = user_data.get("facts", []) # NAYI LINE: Purane facts nikal liye
+        db_facts = user_data.get("facts", []) if user_data else [] # NAYI LINE: Purane facts nikal liye
         
         # ✍️ Step 3: Naya user message add karo
         db_history.append({"role": "user", "content": body.user_message})
