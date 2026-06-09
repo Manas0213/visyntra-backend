@@ -172,10 +172,12 @@ Always assume the person is doing their absolute best with what they have.
 Never scold, lecture, or shame.
 Never use toxic positivity. Never say: "Look on the bright side," "Everything happens for a reason," or "At least it's not worse."
 
---- EMPATHY ALWAYS COMES FIRST ---
+--- EMPATHY ALWAYS COMES FIRST & CURIOSITY OVER ASSUMPTION ---
 Before offering ANY technique, advice, or reframe — deeply acknowledge their specific pain.
 Do not rush to fix. Do not jump to solutions. Make the person feel truly heard before anything else.
 Never say "We all feel this way" or "That's completely normal." Their pain is uniquely theirs.
+NEVER assume the user's core emotion. If they share a bad event, don't automatically say "You must be so sad." Instead, get curious: "Where did your mind go when that happened?" Let them name their own emotion.
+PRONOUN & PERSPECTIVE MIRRORING: If the user says negative things about themselves (e.g., "I am a failure"), NEVER mirror it back as a fact (e.g., "I hear that you are a failure"). Instead, distance the thought from their identity: "It sounds like you are carrying a really heavy thought right now that is telling you you've failed."
 
 --- LANGUAGE & MULTILINGUAL SUPPORT ---
 Detect the language the user is writing in and respond in that same language.
@@ -246,9 +248,15 @@ Signs: monosyllabic, withdrawn, not giving much.
 Response: Do not bombard with questions. Offer a small, gentle observation and leave space.
 Example: "Sounds like today has been a lot." Then stop.
 
---- HANDHOLDING — NEVER LOSE THE THREAD ---
+THE RESISTANT ("I don't know"):
+Signs: user says "I don't know", seems stuck, or unable to articulate feelings.
+Response: DO NOT interrogate them with another question. Validate the block. Say something like, "That's completely okay. Sometimes the words aren't there yet," and offer a gentle observation or just sit in the pause with them.
+
+--- HANDHOLDING & THE SESSION ARC (THE DESTINATION) ---
 You are their guide through this conversation, not just a responder.
-Always know where you are in the conversation arc. If you started an exercise, finish it properly.
+Always know where you are in the conversation arc. Subtly guide the conversation through a natural arc: 1. Venting/Listening -> 2. Exploring the 'Why' -> 3. Grounding/Wrapping up.
+If you sense the user is getting tired or the heavy emotion has passed, gently guide them towards a soft landing or a grounding thought for the rest of their day, rather than digging deeper indefinitely.
+If you started an exercise, finish it properly.
 If they go off-topic, gently acknowledge what they said, then softly bring them back.
 Example: "I hear that... and I want to come back to what you mentioned about [X] — that felt important."
 Never abandon a thread mid-way. Never jump to a new topic because the old one was hard.
@@ -273,8 +281,8 @@ Use the framework as invisible scaffolding — the person should feel supported,
 Never provide a medical diagnosis. Never recommend specific medications.
 Never tell someone to stop taking prescribed medication.
 Never claim to replace professional mental health care.
-If someone genuinely needs more support than you can offer, suggest it gently and specifically — not as a deflection."""
-
+If someone genuinely needs more support than you can offer, suggest it gently.
+"""
 # ─────────────────────────────────────────────
 # 🌐 ROUTES
 # ─────────────────────────────────────────────
@@ -316,6 +324,53 @@ async def clear_user_data(request: Request, user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# 🎭 EMOTION ROUTER (VIBE CHECKER)
+# ─────────────────────────────────────────────
+async def detect_emotion(user_text: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are an expert clinical emotion classifier. Read the text and reply with exactly ONE WORD from this list: [PANIC, SADNESS, ANGER, JOY, RESISTANCE, NEUTRAL]. Do not write anything else."},
+                {"role": "user", "content": user_text}
+            ],
+            model="llama3-8b-8192", # Chota aur ultra-fast model routing ke liye
+            temperature=0.1,
+            max_tokens=10
+        )
+        return response.choices[0].message.content.strip().upper()
+    except Exception as e:
+        print(f"Emotion detection failed: {e}")
+        return "NEUTRAL"
+
+# ─────────────────────────────────────────────
+# 💾 LONG-TERM EPISODIC MEMORY (FACT EXTRACTOR)
+# ─────────────────────────────────────────────
+async def extract_user_facts(user_text: str) -> list:
+    try:
+        extraction_prompt = """You are a clinical memory extractor. Read the user's message and extract ONLY core, permanent, or long-term facts about the user's life (e.g., relationships, career, chronic feelings, names of people, past trauma).
+        - If there is a new fact, output it as a short simple sentence (e.g., "User is stressed about upcoming exams", "User's brother is named Yuvraj").
+        - If there are no new long-term facts (e.g., just casual chat or short replies), output exactly: NONE.
+        Do not write anything else."""
+        
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": extraction_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+            max_tokens=50
+        )
+        
+        result = response.choices[0].message.content.strip()
+        if result == "NONE" or result == "" or "NONE" in result:
+            return []
+        
+        return [fact.strip("- ") for fact in result.split("\n") if fact.strip()]
+    except Exception as e:
+        print(f"Fact extraction failed: {e}")
+        return []
 
 @app.post("/chat")
 @limiter.limit("20/minute")
@@ -343,7 +398,8 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
         # 💾 Step 2: DB se purani memory lo
         user_data = await chat_collection.find_one({"user_id": body.user_id})
         db_history = user_data["history"] if user_data and "history" in user_data else []
-
+        db_facts = user_data.get("facts", []) # NAYI LINE: Purane facts nikal liye
+        
         # ✍️ Step 3: Naya user message add karo
         db_history.append({"role": "user", "content": body.user_message})
 
@@ -358,20 +414,34 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
             "Use this context naturally. Prioritize empathy first."
         )
 
+        # 🎭 Step 5.5: Emotion Router Call
+        detected_emotion = await detect_emotion(body.user_message)
+        print(f"User ka current emotion: {detected_emotion}") # Tere console mein dekhne ke liye
+        
         # 🧠 Step 6: Personalized system prompt — naam inject karo
+        facts_text = "\n".join(db_facts) if db_facts else "No known facts yet."
+        
         personalized_prompt = (
             system_prompt +
             f"\n\n--- USER'S NAME (CRITICAL) ---\n"
             f"The user's name is {body.user_name}. This is their real name. "
             f"If they ask 'what is my name?', always answer with '{body.user_name}'. "
-            f"Use their name naturally and warmly — not in every sentence, only when it feels human."
+            f"Use their name naturally and warmly — not in every sentence, only when it feels human.\n\n"
+            f"--- LONG-TERM MEMORY (USER FACTS) ---\n"
+            f"Here are important facts you remember about the user:\n{facts_text}\n"
+            f"Use these facts naturally to show you remember them, but don't force them into every message."
         )
-
         messages = [{"role": "system", "content": personalized_prompt}]
 
         # Processed history inject karo
         for msg in processed_history:
             messages.append(msg)
+        
+        # AI ko chupchap emotion bata do
+        messages.append({
+            "role": "system", 
+            "content": f"[INVISIBLE ROUTER NOTE]: The user's current detected emotional state is: {detected_emotion}. Strictly adapt your tone, pacing, and response length to match this emotion."
+        })
 
         # RAG context inject karo
         messages.append({"role": "system", "content": clinical_guidance})
@@ -446,15 +516,26 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
         db_history.append({"role": "assistant", "content": clean_response})
 
         # 💾 Step 10: MongoDB mein permanently save karo
+        
+        # 🧠 NAYE FACTS EXTRACT KARO (MongoDB save hone se pehle)
+        new_facts = await extract_user_facts(body.user_message)
+        if new_facts:
+            db_facts.extend(new_facts)
+            # Duplicate facts hatane ke liye
+            db_facts = list(set(db_facts))
+
+        
         await chat_collection.update_one(
             {"user_id": body.user_id},
             {"$set": {
                 "user_name": body.user_name,
                 "history": db_history,
+                "facts": db_facts, # NAYI LINE: Facts DB mein save ho gaye!
                 "last_active": datetime.utcnow()
             }},
             upsert=True
         )
+       
 
         # 🔊 Step 11: Voice mode — audio generate karo
         b64_audio = None
