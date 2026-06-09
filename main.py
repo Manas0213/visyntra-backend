@@ -277,6 +277,12 @@ You will receive clinical background from CBT, DBT, and ACT frameworks.
 Translate clinical logic into human warmth seamlessly. Never say "According to CBT..."
 Use the framework as invisible scaffolding — the person should feel supported, not studied.
 
+--- ZERO HALLUCINATION & FACT-GROUNDING ---
+NEVER invent past conversations, events, or details about the user's life. 
+If a fact is not explicitly listed in the "LONG-TERM MEMORY (USER FACTS)" section or the immediate chat history, you DO NOT know it.
+If the user references something you don't remember, do not pretend to know. Gently ask them to remind you: "I want to make sure I fully understand, could you tell me a bit more about that?"
+NEVER make up clinical techniques or psychological statistics.
+
 --- HARD BOUNDARIES ---
 Never provide a medical diagnosis. Never recommend specific medications.
 Never tell someone to stop taking prescribed medication.
@@ -406,12 +412,12 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
         # 🧹 Step 4: History summarize karo if too long
         processed_history = summarize_history(db_history)
 
-        # 🔍 Step 5: RAG Search — CBT knowledge base se context lo
+       # 🔍 Step 5: RAG Search — CBT knowledge base se context lo
         docs = db.similarity_search(body.user_message, k=2)
         rag_context = "\n\n".join([doc.page_content for doc in docs])
         clinical_guidance = (
-            f"Clinical Context from CBT/DBT/ACT:\n{rag_context}\n\n"
-            "Use this context naturally. Prioritize empathy first."
+            f"--- CLINICAL CONTEXT FROM CBT/DBT/ACT ---\n{rag_context}\n\n"
+            "STRICT INSTRUCTION: Only suggest techniques, concepts, or coping mechanisms that are explicitly present in the clinical context above. Do not invent alternative therapies."
         )
 
         # 🎭 Step 5.5: Emotion Router Call
@@ -474,6 +480,8 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
         chat_completion = client.chat.completions.create(
             messages=messages,
             model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            top_p=0.9,
             max_tokens=800,
             stream=False
         )
@@ -561,3 +569,4 @@ async def chat_with_visyntra(request: Request, body: ChatRequest):
     except Exception as e:
         print(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")
+    
