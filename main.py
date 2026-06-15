@@ -334,7 +334,7 @@ async def clear_user_data(request: Request, user_id: str):
 async def delete_account(user_id: str):
     try:
         # Dhyan de: Yahan 'await' lagaya hai agar tera DB async hai
-        result = await collection.delete_one({"user_id": user_id})
+        result = await chat_collection.delete_one({"user_id": user_id})
         
         # Agar error result.deleted_count par aa rahi thi toh is logic se fix ho jayegi
         if hasattr(result, 'deleted_count') and result.deleted_count == 1:
