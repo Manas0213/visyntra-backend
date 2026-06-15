@@ -330,6 +330,22 @@ async def clear_user_data(request: Request, user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/delete_account/{user_id}")
+async def delete_account(user_id: str):
+    try:
+        # Pura ka pura user document MongoDB se delete kar do (History + Memory/Facts sab udd jayega)
+        result = collection.delete_one({"user_id": user_id})
+        
+        if result.deleted_count == 1:
+            return {"status": "success", "message": "User account and all memories wiped completely."}
+        else:
+            # Agar document nahi mila (already delete ho chuka tha), toh bhi success bhejo
+            return {"status": "success", "message": "No data found for this user."}
+            
+    except Exception as e:
+        print(f"Error deleting account: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete account from database.")
+
 # ─────────────────────────────────────────────
 # 🎭 EMOTION ROUTER (VIBE CHECKER)
 # ─────────────────────────────────────────────
